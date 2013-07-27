@@ -189,7 +189,7 @@ struct bladerf * _bladerf_open_info(const char *dev_path,
         }
 
         /* Determine the device's USB speed */
-        if (_bladerf_ioctl(ret->fd, BLADE_GET_SPEED, &speed))
+        if (_bladerf_ioctl(ret->fd, BLADE_GET_SPEED, &speed, sizeof(speed)))
             goto bladerf_open__err;
         ret->speed = speed;
     }
@@ -280,6 +280,7 @@ int _bladerf_open_libusb(struct bladerf *dev, int index)
 {
     int status, i, n;
     ssize_t count;
+    uint8_t res;
     libusb_device **list;
     status = libusb_init(&dev->usb_context);
     if( status ) {
@@ -291,7 +292,19 @@ int _bladerf_open_libusb(struct bladerf *dev, int index)
             if( n == index ) {
                 dev->usb_dev = list[i];
                 status = libusb_open( list[i], &dev->usb_handle );
+                libusb_claim_interface(dev->usb_handle, 0);
                 libusb_claim_interface(dev->usb_handle, 1);
+                libusb_claim_interface(dev->usb_handle, 2);
+                libusb_control_transfer(
+                    dev->usb_handle,
+                    LIBUSB_RECIPIENT_DEVICE | LIBUSB_REQUEST_TYPE_STANDARD | LIBUSB_ENDPOINT_IN,
+                    10,
+                    0,
+                    0,
+                    &res,
+                    1,
+                    0
+                ) ;
                 break;
             }
             n++;
@@ -844,7 +857,7 @@ int _bladerf_write_peripheral(struct bladerf *dev, uint8_t uart_dev, struct uart
 }
 #endif /* USELIBUSB */
 
-int _bladerf_ioctl(struct bladerf *dev, int cmd, void *data)
+int _bladerf_ioctl(struct bladerf *dev, int cmd, void *data, size_t size)
 {
     int status ;
     uint8_t peripheral = 0xff ;
@@ -893,8 +906,24 @@ int _bladerf_ioctl(struct bladerf *dev, int cmd, void *data)
                 status = _bladerf_write_peripheral( dev, peripheral, peripheral_cmd );
             } else {
                /* TODO: The other IO things */
-               fprintf( stderr, "This thing is not capable of doing this yet\n" ) ;
-               status = 0 ;
+               //fprintf( stderr, "ioctl command: %d\n", cmd ) ;
+               status = libusb_control_transfer(
+                            dev->usb_handle,
+                            LIBUSB_RECIPIENT_INTERFACE | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_IN,
+                            cmd,
+                            0,
+                            0,
+                            data,
+                            size,
+                            1000
+                        ) ;
+                if( status < 0 ) {
+                    fprintf( stderr, "ioctl error: %s\n", libusb_error_name(status) );
+                    dev->usb_errno = status ;
+                } else {
+                    // fprintf( stderr, "transferred %d bytes\n", status );
+                    status = 0;
+                }
             }
             break;
 #endif
@@ -905,15 +934,16 @@ int _bladerf_ioctl(struct bladerf *dev, int cmd, void *data)
 int bladerf_is_fpga_configured(struct bladerf *dev)
 {
     int status;
-    uint8_t configured;
+    int configured;
     int result;
 
     assert(dev);
 
-    status = _bladerf_ioctl(dev, BLADE_QUERY_FPGA_STATUS, &configured);
+    status = _bladerf_ioctl(dev, BLADE_QUERY_FPGA_STATUS, &configured, sizeof(configured));
     if (status || configured < 0 || configured > 1) {
         configured = BLADERF_ERR_IO;
     }
+    //fprintf( stderr, "FPGA Configuration: %d\n", configured ) ;
     return configured;
 }
 
@@ -937,7 +967,7 @@ int bladerf_get_fw_version(struct bladerf *dev,
 
     assert(dev && major && minor);
 
-    status = _bladerf_ioctl(dev, BLADE_QUERY_VERSION, &ver);
+    status = _bladerf_ioctl(dev, BLADE_QUERY_VERSION, &ver, sizeof(ver));
     if (!status) {
         *major = ver.major;
         *minor = ver.minor;
@@ -1039,7 +1069,7 @@ int bladerf_flash_firmware(struct bladerf *dev, const char *firmware)
     assert(n_read == fw_param.len);
 
     ret = 0;
-    upgrade_status = _bladerf_ioctl(dev, BLADE_UPGRADE_FW, &fw_param);
+    upgrade_status = _bladerf_ioctl(dev, BLADE_UPGRADE_FW, &fw_param, sizeof(fw_param));
     if (upgrade_status < 0) {
         dbg_printf("Firmware upgrade failed: %s\n", strerror(errno));
         ret = BLADERF_ERR_UNEXPECTED;
@@ -1070,12 +1100,17 @@ int bladerf_load_fpga(struct bladerf *dev, const char *fpga)
     char buf[STACK_BUFFER_SZ];
     struct timeval end_time, curr_time;
     bool timed_out;
+    int res;
+    int transferred;
+    char *newbuf ;
+    struct libusb_config_descriptor *conf ;
+    int i ;
 
     assert(dev && fpga);
 
     /* TODO Check FPGA on the board versus size of image */
 
-    if (_bladerf_ioctl(dev, BLADE_QUERY_FPGA_STATUS, &fpga_status) < 0) {
+    if (_bladerf_ioctl(dev, BLADE_QUERY_FPGA_STATUS, &fpga_status, sizeof(fpga_status)) < 0) {
         dbg_printf("ioctl(BLADE_QUERY_FPGA_STATUS) failed: %s\n",
                     strerror(errno));
         return BLADERF_ERR_UNEXPECTED;
@@ -1098,35 +1133,83 @@ int bladerf_load_fpga(struct bladerf *dev, const char *fpga)
         return BLADERF_ERR_IO;
     }
 
-    if (_bladerf_ioctl(dev, BLADE_BEGIN_PROG, &fpga_status)) {
-        dbg_printf("ioctl(BLADE_BEGIN_PROG) failed: %s\n", strerror(errno));
+    fprintf( stderr, "Starting to program the FPGA\n" ) ;
+#ifdef USELIBUSB
+    if( dev->driver == LIBUSB ) {
+        res = libusb_claim_interface(dev->usb_handle,1);
+        if( res ) {
+            fprintf( stderr, "error claiming interface: %s\n", libusb_error_name(res) );
+        }
+        res = libusb_set_interface_alt_setting(dev->usb_handle,1,0);
+        if( res ) {
+            fprintf( stderr, "error setting alt interface: %s\n", libusb_error_name(res) );
+        }
+        fprintf( stderr, "Claimed the interfaces\n" ) ;
+    }
+#endif
+    if (_bladerf_ioctl(dev, BLADE_BEGIN_PROG, &fpga_status, sizeof(fpga_status))) {
+        fprintf(stderr, "ioctl(BLADE_BEGIN_PROG) failed: %s\n", strerror(errno));
         close(fpga_fd);
         return BLADERF_ERR_UNEXPECTED;
     }
 
-    for (bytes = stat.st_size; bytes;) {
-        nread = read(fpga_fd, buf, min_sz(STACK_BUFFER_SZ, bytes));
+    newbuf = (uint8_t *)malloc(stat.st_size) ;
+    bytes = read(fpga_fd, newbuf, stat.st_size);
 
-        written = 0;
-        do {
-            write_tmp = write(dev->fd, buf + written, nread - written);
-            if (write_tmp < 0) {
-                /* Failing out...at least attempt to "finish" programming */
-                _bladerf_ioctl(dev, BLADE_END_PROG, &ret);
-                dbg_printf("Write failure: %s\n", strerror(errno));
-                close(fpga_fd);
-                return BLADERF_ERR_IO;
-            } else {
-                written += write_tmp;
-            }
-        } while(written < nread);
-
-        bytes -= nread;
-
-        /* FIXME? Perhaps it would be better if the driver blocked on the
-         * write call, rather than sleeping in userspace? */
-        usleep(4000);
+    res = libusb_get_active_config_descriptor(dev->usb_dev, &conf) ;
+    for(i = 0 ; i < conf->interface[0].altsetting[0].bNumEndpoints; i++ ) {
+        fprintf( stderr, "EP: %x\n", conf->interface[1].altsetting[0].endpoint[i].bEndpointAddress ) ;
     }
+
+    while( bytes > 0 ) {
+        res = libusb_bulk_transfer( dev->usb_handle, 0x02, buf, bytes >= 4096 ? 4096 : bytes, &transferred, 1000 );
+        fprintf( stderr, "res: %s transferred: %d\n", libusb_error_name(res), transferred );
+        bytes -= transferred ;
+        newbuf += transferred ;
+    }
+
+    while(true) {
+        int r = bladerf_is_fpga_configured(dev);
+        if(r) {
+            break ;
+        }
+    }
+    bytes = 0 ;
+    free(newbuf) ;
+
+//    for (bytes = stat.st_size; bytes;) {
+//        nread = read(fpga_fd, buf, min_sz(STACK_BUFFER_SZ, bytes));
+//
+//        written = 0;
+//        do {
+//            if( dev->driver == KERNEL ) {
+//                write_tmp = write(dev->fd, buf + written, nread - written);
+//            }
+//#ifdef USELIBUSB
+//            else {
+//                fprintf( stderr, "Writing %zd\n", nread-written );
+//                res = libusb_bulk_transfer( dev->usb_handle, 0x02, buf + written, nread - written, &transferred, 0 );
+//                fprintf( stderr, "  res: %d write_tmp: %zd\n", res, write_tmp );
+//                write_tmp = transferred ;
+//            }
+//#endif
+//            if (write_tmp < 0) {
+//                /* Failing out...at least attempt to "finish" programming */
+//                _bladerf_ioctl(dev, BLADE_END_PROG, &ret, sizeof(fpga_status));
+//                fprintf(stderr, "Write failure: %s\n", strerror(errno));
+//                close(fpga_fd);
+//                return BLADERF_ERR_IO;
+//            } else {
+//                written += write_tmp;
+//            }
+//        } while(written < nread);
+//
+//        bytes -= nread;
+//
+//        /* FIXME? Perhaps it would be better if the driver blocked on the
+//         * write call, rather than sleeping in userspace? */
+//        usleep(4000);
+//    }
     close(fpga_fd);
 
     /* Debug mode bug catcher */
@@ -1138,15 +1221,15 @@ int bladerf_load_fpga(struct bladerf *dev, const char *fpga)
 
     ret = 0;
     do {
-        if (_bladerf_ioctl(dev, BLADE_QUERY_FPGA_STATUS, &fpga_status) < 0) {
-            dbg_printf("Failed to query FPGA status: %s\n", strerror(errno));
+        if (_bladerf_ioctl(dev, BLADE_QUERY_FPGA_STATUS, &fpga_status, sizeof(fpga_status)) < 0) {
+            fprintf(stderr, "Failed to query FPGA status: %s\n", strerror(errno));
             ret = BLADERF_ERR_UNEXPECTED;
         }
         gettimeofday(&curr_time, NULL);
         timed_out = time_past(end_time, curr_time);
     } while(!fpga_status && !timed_out && !ret);
 
-    if (_bladerf_ioctl(dev, BLADE_END_PROG, &fpga_status)) {
+    if (_bladerf_ioctl(dev, BLADE_END_PROG, &fpga_status, sizeof(fpga_status))) {
         dbg_printf("Failed to end programming procedure: %s\n",
                 strerror(errno));
 
@@ -1156,6 +1239,7 @@ int bladerf_load_fpga(struct bladerf *dev, const char *fpga)
     }
 
     /* Now that the FPGA is loaded, initialize the device */
+    fprintf( stderr, "Initializing device\n" );
     _bladerf_init_device(dev);
 
     return ret;
@@ -1172,7 +1256,7 @@ int si5338_i2c_read(struct bladerf *dev, uint8_t address, uint8_t *val)
     address &= 0x7f;
     uc.addr = address;
     uc.data = 0xff;
-    ret = _bladerf_ioctl(dev, BLADE_SI5338_READ, &uc);
+    ret = _bladerf_ioctl(dev, BLADE_SI5338_READ, &uc, sizeof(uc));
     *val = uc.data;
     return ret;
 }
@@ -1182,7 +1266,7 @@ int si5338_i2c_write(struct bladerf *dev, uint8_t address, uint8_t val)
     struct uart_cmd uc;
     uc.addr = address;
     uc.data = val;
-    return _bladerf_ioctl(dev, BLADE_SI5338_WRITE, &uc);
+    return _bladerf_ioctl(dev, BLADE_SI5338_WRITE, &uc, sizeof(uc));
 }
 
 /*------------------------------------------------------------------------------
@@ -1196,7 +1280,7 @@ int lms_spi_read(struct bladerf *dev, uint8_t address, uint8_t *val)
     address &= 0x7f;
     uc.addr = address;
     uc.data = 0xff;
-    ret = _bladerf_ioctl(dev, BLADE_LMS_READ, &uc);
+    ret = _bladerf_ioctl(dev, BLADE_LMS_READ, &uc, sizeof(uc));
     *val = uc.data;
     return ret;
 }
@@ -1206,7 +1290,7 @@ int lms_spi_write(struct bladerf *dev, uint8_t address, uint8_t val)
     struct uart_cmd uc;
     uc.addr = address;
     uc.data = val;
-    return _bladerf_ioctl(dev, BLADE_LMS_WRITE, &uc);
+    return _bladerf_ioctl(dev, BLADE_LMS_WRITE, &uc, sizeof(uc));
 }
 
 /*------------------------------------------------------------------------------
@@ -1222,7 +1306,7 @@ int gpio_read(struct bladerf *dev, uint32_t *val)
     for (i = 0; i < 4; i++) {
         uc.addr = i;
         uc.data = 0xff;
-        ret = _bladerf_ioctl(dev, BLADE_GPIO_READ, &uc);
+        ret = _bladerf_ioctl(dev, BLADE_GPIO_READ, &uc, sizeof(uc));
         if (ret) {
             if (errno == ETIMEDOUT) {
                 ret = BLADERF_ERR_TIMEOUT;
@@ -1253,7 +1337,7 @@ int gpio_write(struct bladerf *dev, uint32_t val)
     for (i = 0; i < 4; i++) {
         uc.addr = i;
         uc.data = val >> (i * 8);
-        ret = _bladerf_ioctl(dev, BLADE_GPIO_WRITE, &uc);
+        ret = _bladerf_ioctl(dev, BLADE_GPIO_WRITE, &uc, sizeof(uc));
         if (ret) {
             if (errno == ETIMEDOUT) {
                 ret = BLADERF_ERR_TIMEOUT;
@@ -1279,7 +1363,7 @@ int dac_write(struct bladerf *dev, uint16_t val)
     for (i = 0; i < 4; i++) {
         uc.addr = i;
         uc.data = val >> (i * 8);
-        ret = _bladerf_ioctl(dev, BLADE_VCTCXO_WRITE, &uc);
+        ret = _bladerf_ioctl(dev, BLADE_VCTCXO_WRITE, &uc, sizeof(uc));
         if (ret)
             break;
     }
