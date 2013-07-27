@@ -31,17 +31,13 @@
 #define BLADE_USB_CMD_END_PROG                  3
 #define BLADE_USB_CMD_RF_RX                     4
 #define BLADE_USB_CMD_RF_TX                     5
+#define BLADE_USB_CMD_UART_READ                 6
+#define BLADE_USB_CMD_UART_WRITE                7
 #define BLADE_USB_CMD_FLASH_READ              100
 #define BLADE_USB_CMD_FLASH_WRITE             101
 #define BLADE_USB_CMD_FLASH_ERASE             102
 #define BLADE_USB_CMD_READ_OTP                103
 #define BLADE_USB_CMD_WRITE_OTP               104
-
-#define BLADE_USB_CMD_QUERY_VERSION      0
-#define BLADE_USB_CMD_QUERY_FPGA_STATUS  1
-#define BLADE_USB_CMD_BEGIN_PROG         2
-#define BLADE_USB_CMD_END_PROG           3
-#define BLADE_USB_CMD_RF_RX              4
 
 struct bladeRF_version {
     unsigned short major;

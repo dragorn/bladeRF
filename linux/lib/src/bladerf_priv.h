@@ -4,6 +4,20 @@
 #ifndef BLADERF_PRIV_H_
 #define BLADERF_PRIV_H_
 
+#ifdef USELIBUSB
+    #ifdef _MSC_VER
+        #include <libusb.h>
+    #else
+        #include <libusb-1.0/libusb.h>
+    #endif /* _MSC_VER */
+#endif /* USELIBUSB */
+
+
+typedef enum {
+    KERNEL,
+    LIBUSB
+} bladerf_driver ;
+
 /* TODO Should there be a "big-lock" wrapped around accesses to a device */
 struct bladerf {
     int fd;         /* File descriptor to associated driver device node */
@@ -17,6 +31,16 @@ struct bladerf {
     /* FIXME temporary workaround for not being able to read back sample rate */
     unsigned int last_tx_sample_rate;
     unsigned int last_rx_sample_rate;
+
+    bladerf_driver driver ;
+
+#ifdef USELIBUSB
+    /* libusb interfacing */
+    libusb_device           *usb_dev;
+    libusb_device_handle    *usb_handle;
+    libusb_context          *usb_context;
+    int                     usb_errno;
+#endif
 };
 
 #endif
